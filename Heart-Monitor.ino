@@ -1,13 +1,12 @@
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
 #include <Wire.h>
+#define WS_MAX_QUEUED_MESSAGES 15 // Limit to prevent heap overflow
+#include <ESPAsyncWebServer.h>
 #include "MAX30105.h"
 #include "heartRate.h"  // Includes algorithm for calculating heart rate
 
-// WiFi Credentials
-const char *ssid = "56k or Broke";
-const char *password = "L@yla25!";
+#include "web_index.h"
+#include "secrets.h"
 
 MAX30105 particleSensor;
 
@@ -19,9 +18,23 @@ long lastBeat = 0;  // Time at which the last beat occurred
 
 float beatsPerMinute;
 int beatAvg = 0;
-float lastSpO2 = 0;
-unsigned long dynamicNotifyInterval = 33; // Default 30Hz
 unsigned long wsMsgCount = 0;
+
+float lastSpO2 = 0;
+float lastPI = 0;
+float lastTemp = 0;
+float lastHRV = 0;
+int lastConfidence = 0;
+String currentStatus = "Idle";
+int currentRSSI = 0;
+unsigned long lastIBI = 0;
+float sqDiffs[16];
+int diffSpot = 0;
+unsigned long dynamicNotifyInterval = 33;
+
+long irBatch[5]; // Buffer for 5 samples
+int irBatchIdx = 0;
+unsigned long lastSampleTime = 0;
 
 // Web Server and WebSocket
 AsyncWebServer server(80);
@@ -29,15 +42,37 @@ AsyncWebSocket ws("/ws");
 
 #define debug Serial
 
-#include "web_index.h"
+// 1. High-frequency Serial for Web Serial (Low-latency)
+void sendSerialPulse(long irValue) {
+  debug.printf(">DATA:{\"ir\":%ld}\n", irValue);
+}
 
-void notifyClients(long irValue) {
+// 2. Batched WebSocket (Network efficient)
+void sendPulse() {
   if (ws.count() > 0) {
-    char json[96];
-    snprintf(json, sizeof(json), "{\"bpm\":%d,\"spo2\":%.1f,\"ir\":%ld}", beatAvg, lastSpO2, irValue);
+    String json = "{\"ir\":[";
+    for(int i=0; i<5; i++) {
+      json += String(irBatch[i]);
+      if(i < 4) json += ",";
+    }
+    json += "]}";
     ws.textAll(json);
     wsMsgCount++;
   }
+}
+
+void sendMetrics() {
+  char json[256];
+  snprintf(json, sizeof(json), "{\"bpm\":%d,\"spo2\":%.1f,\"pi\":%.2f,\"temp\":%.1f,\"hrv\":%.1f,\"conf\":%d,\"status\":\"%s\",\"rssi\":%d}", 
+           beatAvg, lastSpO2, lastPI, lastTemp, lastHRV, lastConfidence, currentStatus.c_str(), currentRSSI);
+  
+  // WebSocket
+  if (ws.count() > 0) {
+    ws.textAll(json);
+    wsMsgCount++;
+  }
+  // Serial
+  debug.printf(">DATA:%s\n", json);
 }
 
 void setup() {
@@ -74,29 +109,31 @@ void setup() {
       case WS_EVT_CONNECT:
         debug.printf("WS: Client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
         break;
-      case WS_EVT_DISCONNECT: {
-        uint16_t reason = 0;
-        if (arg != NULL && len >= 2) {
-          reason = (data[0] << 8) | data[1];
+      case WS_EVT_DISCONNECT:
+        {
+          uint16_t reason = 0;
+          if (arg != NULL && len >= 2) {
+            reason = (data[0] << 8) | data[1];
+          }
+          debug.printf("WS: Client #%u disconnected (Reason: %u)\n", client->id(), reason);
+          break;
         }
-        debug.printf("WS: Client #%u disconnected (Reason: %u)\n", client->id(), reason);
-        break;
-      }
-      case WS_EVT_DATA: {
-        AwsFrameInfo *info = (AwsFrameInfo*)arg;
-        if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-          data[len] = 0;
-          String msg = (char*)data;
-          if (msg.startsWith("{\"freq\":")) {
-            int freq = msg.substring(8, msg.length() - 1).toInt();
-            if (freq >= 1 && freq <= 100) {
-              dynamicNotifyInterval = 1000 / freq;
-              debug.printf("WS: Frequency set to %d Hz (%d ms)\n", freq, dynamicNotifyInterval);
+      case WS_EVT_DATA:
+        {
+          AwsFrameInfo *info = (AwsFrameInfo *)arg;
+          if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+            data[len] = 0;
+            String msg = (char *)data;
+            if (msg.startsWith("{\"freq\":")) {
+              int freq = msg.substring(8, msg.length() - 1).toInt();
+              if (freq >= 1 && freq <= 100) {
+                dynamicNotifyInterval = 1000 / freq;
+                debug.printf("WS: Frequency set to %d Hz (%d ms)\n", freq, dynamicNotifyInterval);
+              }
             }
           }
+          break;
         }
-        break;
-      }
       case WS_EVT_PONG:
         debug.printf("WS: Client #%u pong\n", client->id());
         break;
@@ -114,38 +151,74 @@ void setup() {
   server.begin();
 }
 
-void loop() {
-  ws.cleanupClients();
-  delay(1);
+long currentIR = 0;  // Global to share between modules
 
-  particleSensor.check();  // Check sensor for new data
-  static long currentIR = 0; // Static to persist last real reading
+void readSensor() {
+  particleSensor.check();
+  static long minIR = 262143;
+  static long maxIR = 0;
 
   while (particleSensor.available()) {
     long irValue = particleSensor.getFIFOIR();
     long redValue = particleSensor.getFIFORed();
-    currentIR = irValue;  // We use the latest sample for threshold logic
+    currentIR = irValue;
+
+    // Track min/max for Perfusion Index (PI) calculation
+    if (irValue > 10000) {
+      if (irValue < minIR) minIR = irValue;
+      if (irValue > maxIR) maxIR = irValue;
+    }
 
     if (checkForBeat(irValue) == true) {
+      // Calculate Perfusion Index (PI) for the finished beat
+      if (maxIR > minIR && minIR > 10000) {
+        long ac = maxIR - minIR;
+        long dc = (maxIR + minIR) / 2;
+        lastPI = ((float)ac / (float)dc) * 100.0;
+      }
+      // Reset for next beat
+      minIR = 262143;
+      maxIR = 0;
+
       if (lastBeat == 0) {
-        lastBeat = millis();  // First beat: start the clock
+        lastBeat = millis();
+        currentStatus = "Seeking Pulse";
         debug.println(" [Heart Pulse Detected!]");
       } else {
         long delta = millis() - lastBeat;
         if (delta > 250) {
           lastBeat = millis();
           beatsPerMinute = 60 / (delta / 1000.0);
-
           if (beatsPerMinute < 220 && beatsPerMinute > 40) {
-            bool acceptValue = false;
-            if (beatAvg == 0) {
-              acceptValue = true;
-            } else {
-              if (beatsPerMinute > (beatAvg * 0.7) && beatsPerMinute < (beatAvg * 1.3)) {
-                acceptValue = true;
+            // 1. HRV Calculation (RMSSD)
+            if (lastIBI > 0) {
+              long diff = (long)delta - (long)lastIBI;
+              sqDiffs[diffSpot++] = (float)(diff * diff);
+              diffSpot %= 16;
+              
+              float sum = 0;
+              int count = 0;
+              for(int i=0; i<16; i++) {
+                if(sqDiffs[i] > 0) { sum += sqDiffs[i]; count++; }
               }
+              if (count > 0) lastHRV = sqrt(sum / count);
             }
+            lastIBI = delta;
 
+            // 2. Confidence Score (0-100)
+            float bpmDiff = abs(beatsPerMinute - beatAvg);
+            float bpmConf = (beatAvg > 0) ? (1.0 - (bpmDiff / (float)beatAvg)) : 0.8;
+            if (bpmConf < 0) bpmConf = 0;
+            
+            float piConf = 0;
+            if (lastPI > 0.5 && lastPI < 10.0) piConf = 1.0;
+            else if (lastPI > 0.2) piConf = 0.5;
+            
+            lastConfidence = (int)((bpmConf * 0.6 + piConf * 0.4) * 100);
+            if (lastConfidence > 100) lastConfidence = 100;
+
+            // 3. Update BPM Buffer
+            bool acceptValue = (beatAvg == 0) || (beatsPerMinute > (beatAvg * 0.7) && beatsPerMinute < (beatAvg * 1.3));
             if (acceptValue) {
               rates[rateSpot++] = (byte)beatsPerMinute;
               rateSpot %= RATE_SIZE;
@@ -158,13 +231,12 @@ void loop() {
                 }
               }
               if (count > 0) beatAvg /= count;
+              currentStatus = "Pulse Acquired";
             }
           }
         }
       }
     }
-
-    // Basic SpO2 update
     static unsigned long lastSpO2Time = 0;
     if (irValue > 10000 && millis() - lastSpO2Time > 1000) {
       float R = (float)redValue / (float)irValue;
@@ -172,20 +244,18 @@ void loop() {
       if (lastSpO2 > 100) lastSpO2 = 100;
       lastSpO2Time = millis();
     }
-
-    particleSensor.nextSample();  // Advance to next sample in FIFO
+    particleSensor.nextSample();
   }
+}
 
-  // Watchdog & Finger Detection
+void handleWatchdog() {
   static unsigned long lastCommTime = millis();
   static unsigned long fingerOffTime = 0;
   static unsigned long lastNoFingerPrint = 0;
 
-  int samplesRead = particleSensor.check();
-  if (samplesRead > 0) {
-    lastCommTime = millis();
-  } else if (millis() - lastCommTime > 5000) {
-    debug.println(">>> I2C Communication Lost! Attempting recovery...");
+  if (particleSensor.check() > 0) lastCommTime = millis();
+  else if (millis() - lastCommTime > 5000) {
+    debug.println(">>> I2C Recovery...");
     if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
       particleSensor.setup(0x24, 4, 2, 200, 411, 4096);
       particleSensor.wakeUp();
@@ -195,70 +265,84 @@ void loop() {
 
   if (currentIR < 10000) {
     if (fingerOffTime == 0) fingerOffTime = millis();
-    if (millis() - fingerOffTime > 1000) {        // 1 second debounce
-      if (millis() - lastNoFingerPrint > 2000) {  // Only print every 2s
-        if (currentIR == 0) debug.println("! Wait for sensor...");
-        else {
-          debug.print(" Idle (IR=");
-          debug.print(currentIR);
-          debug.println(")");
-        }
+    if (millis() - fingerOffTime > 1000) {
+      if (millis() - lastNoFingerPrint > 2000) {
+        if (currentIR == 0) debug.println("! Sensor Busy...");
+        else debug.printf(" Idle (IR=%ld)\n", currentIR);
         lastNoFingerPrint = millis();
       }
-
       beatAvg = 0;
       beatsPerMinute = 0;
       lastSpO2 = 0;
       lastBeat = 0;
+      lastHRV = 0;
+      lastIBI = 0;
+      lastConfidence = 0;
+      currentStatus = "Idle";
+      for (int i = 0; i < 16; i++) sqDiffs[i] = 0;
       for (byte x = 0; x < RATE_SIZE; x++) rates[x] = 0;
       rateSpot = 0;
     }
   } else {
     fingerOffTime = 0;
-    if (beatAvg == 0) {
-      static unsigned long lastWaitPrint = 0;
-      if (millis() - lastWaitPrint > 1000) {
-        debug.println(" [Finger detected, waiting for pulse lock...]");
-        lastWaitPrint = millis();
-      }
+    static unsigned long lastWaitPrint = 0;
+    if (beatAvg == 0 && millis() - lastWaitPrint > 1000) {
+      debug.println(" [Reading Pulse...]");
+      lastWaitPrint = millis();
     }
   }
+}
 
-  static unsigned long lastNotifyTime = 0;
+void broadcastTelemetry() {
+  static unsigned long lastPulseTime = 0;
+  static unsigned long lastMetricsTime = 0;
   static unsigned long lastSerialPrint = 0;
-  unsigned long notifyInterval = (currentIR > 10000) ? dynamicNotifyInterval : 500;
-  
-  if (millis() - lastNotifyTime > notifyInterval) {
-    notifyClients(currentIR);
-    lastNotifyTime = millis();
-  }
-  if (millis() - lastSerialPrint > 500) { // Slower serial logging
-    lastSerialPrint = millis();
-    debug.print(" IR[");
-    debug.print(currentIR);
-    debug.print("]");
-    debug.print(" BPM=");
-    debug.print(beatAvg);
-    debug.print(" (Raw=");
-    debug.print(beatsPerMinute);
-    debug.print("), SpO2=");
-    debug.print(lastSpO2);
-    debug.print(" | Heap: ");
-    debug.print(ESP.getFreeHeap());
-    debug.println("");
+  static unsigned long lastWsStats = 0;
+  static unsigned long lastTempRead = 0;
+
+  // 0. Periodic Sensor Tasks (Temperature)
+  if (millis() - lastTempRead > 2000) {
+    lastTemp = particleSensor.readTemperature();
+    currentRSSI = WiFi.RSSI();
+    lastTempRead = millis();
   }
 
-  // WS Transmission Telemetry
-  static unsigned long lastWsStats = 0;
-  if (millis() - lastWsStats > 1000) {
-    if (ws.count() > 0) {
-      debug.printf(">>> WS Status: %d clients, Rate: %lu msgs/sec | Heap: %d\n", ws.count(), wsMsgCount, ESP.getFreeHeap());
-      // Print one sample JSON for verification
-      char sample[96];
-      snprintf(sample, sizeof(sample), "{\"bpm\":%d,\"spo2\":%.1f,\"ir\":%ld}", beatAvg, lastSpO2, currentIR);
-      debug.printf(">>> Sample Payload: %s\n", sample);
+  // 1. High Frequency Tasks (50Hz / 20ms)
+  if (currentIR > 10000 && (millis() - lastSampleTime >= 20)) {
+    lastSampleTime = millis();
+    
+    // Always send individual frame to Serial for USB smoothness
+    sendSerialPulse(currentIR);
+
+    // Batch for WebSocket stability
+    irBatch[irBatchIdx++] = currentIR;
+    if (irBatchIdx >= 5) {
+      sendPulse();
+      irBatchIdx = 0;
+      lastPulseTime = millis();
     }
+  }
+
+  // 3. Metrics (Stable 500ms)
+  if (millis() - lastMetricsTime > 500) {
+    sendMetrics();
+    lastMetricsTime = millis();
+  }
+  if (millis() - lastSerialPrint > 500) {
+    lastSerialPrint = millis();
+    debug.printf(" IR[%ld] BPM=%d (Raw=%.1f), SpO2=%.1f | Heap: %d\n", currentIR, beatAvg, beatsPerMinute, lastSpO2, ESP.getFreeHeap());
+  }
+  if (millis() - lastWsStats > 1000) {
+    if (ws.count() > 0) debug.printf(">>> WS: %d clips, %lu msgs/sec | Int: %lu ms\n", ws.count(), wsMsgCount, dynamicNotifyInterval);
     wsMsgCount = 0;
     lastWsStats = millis();
   }
+}
+
+void loop() {
+  ws.cleanupClients();
+  readSensor();
+  handleWatchdog();
+  broadcastTelemetry();
+  delay(1);
 }

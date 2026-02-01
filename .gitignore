@@ -1,0 +1,9 @@
+secrets.h
+.gemini/
+.pio/
+.vscode/
+bin/
+obj/
+*.bin
+*.elf
+*.hex

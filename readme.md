@@ -1,86 +1,66 @@
-# Vital Sense: ESP32 Health Monitor (BPM & SpO2)
+# Vital Sense: Advanced MAX30102 Heart Monitor
 
-A premium, real-time health monitoring system using the ESP32 and MAX30102 sensor. This project features a high-performance web dashboard with live PPG waveform plotting, heart rate (BPM) tracking, and oxygen saturation (SpO2) monitoring.
+A high-performance Heart Rate and SpO2 monitoring system for the ESP32, featuring a real-time web dashboard with dual-transport telemetry (WebSocket + Web Serial).
 
-![Project Status](https://img.shields.io/badge/Status-Functional-success)
-![Hardware](https://img.shields.io/badge/Hardware-ESP32%20%7C%20MAX30102-blue)
-![Environment](https://img.shields.io/badge/Environment-Arduino%20IDE-orange)
+![Dashboard Preview](https://via.placeholder.com/800x400?text=Vital+Sense+Dashboard+Preview)
 
-## 🚀 Features
+## ✨ Features
 
-- **Live PPG Waveform**: High-speed (30Hz) real-time plotting of the actual heartbeat pulse.
-- **Heart Metrics**: Near-instant BPM calculation and stabilized SpO2 tracking.
-- **Modern Web Dashboard**: Dark-mode, responsive UI built with vanilla JS and Chart.js.
-- **Dynamic Frequency Tuning**: Adjustable WebSocket update rate (1Hz - 100Hz) controlled via a web slider.
-- **Intelligent Watchdog**: Automatic sensor recovery and re-initialization on I2C communication failure.
-- **Session Intelligence**: Instant "lock-on" logic that resets buffers on finger removal for immediate new readings.
+- **Live PPG Waveform**: 50Hz real-time pulse visualization with ultra-smooth batching.
+- **Advanced Health Metrics**:
+  - **HRV (RMSSD)**: Real-time Heart Rate Variability calculation (ms).
+  - **Signal Confidence**: 0-100% reliability score based on pulse strength and stability.
+  - **SpO2**: Accurate oxygen saturation tracking.
+  - **Perfusion Index (PI)**: Measurement of peripheral blood flow/signal strength.
+  - **Die Temperature**: Integrated sensor temperature monitoring.
+- **Dual-Transport Telemetry**:
+  - **Wireless**: Stable WebSockets with heap protection.
+  - **Wired**: Ultra-low latency **Web Serial (USB)** directly to your browser (60fps+).
+- **Intelligent Algorithm**:
+  - Dynamic noise filtering and jump rejection.
+  - 10-sample rolling average for stable BPM.
+  - Auto-recovery for I2C and sensor "finger off" states.
+- **Premium Dashboard**:
+  - Modern CSS Glassmorphism design with Dark Mode.
+  - Real-time Chart.js integration with optimized scaling.
+  - Responsive layout for desktop and tablet.
 
-## 🛠 hardware Requirements
+## 🚀 Getting Started
 
-- **Microcontroller**: ESP32 (Any standard DevKit).
-- **Sensor**: MAX30102 (Pulse Oximeter and Heart-Rate Sensor).
-- **Wiring**: 4 Jumpers (I2C interface).
+### Prerequisites
+- **ESP32** (DevKit V1 or similar)
+- **MAX30102** or **MAX30105** sensor
+- Arduino IDE with the following libraries:
+  - `SparkFun MAX3010x Pulse and Proximity Sensor Library`
+  - `ESPAsyncWebServer`
+  - `AsyncTCP`
 
-### Wiring Diagram
+### Installation
+1. Clone this repository.
+2. Open `Heart-Monitor.ino`.
+3. Set your WiFi credentials in the `WiFi Credentials` section.
+4. Upload to your ESP32.
+5. Open the IP address shown in the Serial Monitor (e.g., `http://192.168.1.50`).
 
-```mermaid
-graph LR
-    ESP32[ESP32 Development Board]
-    MAX[MAX30102 Sensor]
+### 🔌 Using Web Serial (Insecure Origin Setup)
+Web Serial is a powerful feature but is restricted to **Secure Contexts** (HTTPS or localhost) by default. Since the ESP32 typically serves via a local IP (`http://...`), you must manually whitelist it in your browser:
 
-    ESP32 --- |3.3V| MAX
-    ESP32 --- |GND| MAX
-    ESP32 --- |SDA / GPIO 21| MAX
-    ESP32 --- |SCL / GPIO 22| MAX
-```
+1.  **Open Browser Flags**:
+    *   **Chrome**: Paste `chrome://flags/#unsafely-treat-insecure-origin-as-secure` into the address bar.
+    *   **Edge**: Paste `edge://flags/#unsafely-treat-insecure-origin-as-secure` into the address bar.
+2.  **Enable the Flag**:
+    *   Find the **"Insecure origins treated as secure"** setting and set it to **Enabled**.
+3.  **Whitelist your IP**:
+    *   Add your ESP32's address to the text box (e.g., `http://192.168.1.xx`).
+    *   *Tip: You can add multiple IPs separated by commas.*
+4.  **Relaunch**: Click the **Relaunch** button at the bottom of the browser.
+5.  **Connect**: On the dashboard, click **"Connect via USB"** and select your ESP32's COM port.
 
-## 💻 Software Setup
+## 🛠️ Hardware Wiring
+- **VIN** -> 3.3V
+- **GND** -> GND
+- **SDA** -> GPIO 21 (ESP32)
+- **SCL** -> GPIO 22 (ESP32)
 
-### 1. Arduino IDE
-Ensure you have the [Arduino IDE](https://www.arduino.cc/en/software) installed and the ESP32 board support added (Tools > Board > Boards Manager > search for "esp32").
-
-### 2. Required Libraries
-Install the following libraries via the Arduino Library Manager (Tools > Manage Libraries):
-- **SparkFun MAX3010x Pulse and Proximity Sensor Library**
-- **ESPAsyncWebServer**
-- **AsyncTCP**
-
-### 3. Repository Structure
-```text
-Heart-Monitor/
-├── Heart-Monitor.ino   # Main firmware logic
-├── web_index.h         # Embedded HTML/JS/CSS dashboard
-└── README.md           # Documentation
-```
-
-## 🚀 Quick Start
-
-1. **Clone the repository** to your local machine.
-2. Open `Heart-Monitor.ino` in the Arduino IDE.
-3. Update your **WiFi credentials** in the `Heart-Monitor.ino` file:
-   ```cpp
-   const char *ssid = "YOUR_WIFI_SSID";
-   const char *password = "YOUR_WIFI_PASSWORD";
-   ```
-4. **Upload** the code to your ESP32.
-5. Open the **Serial Monitor** (115200 baud) to find the ESP32's IP address.
-6. Open your web browser and navigate to `http://<ESP32_IP_ADDRESS>`.
-
-## ⚠️ Troubleshooting & Tips
-
-### Sensor Placement
-- **Light Pressure**: Do not press too hard! Excessive pressure can restrict blood flow in the finger, leading to inaccurate readings. Rest your finger lightly on the sensor.
-- **Ambient Light**: The MAX30102 is sensitive to sunlight and incandescent bulbs. Cover the sensor/finger if readings are erratic.
-- **Movement**: Stay still during the "Waiting for pulse lock" phase for the most accurate BPM calculation.
-
-### SpO2 Reliability
-- If SpO2 is consistently below 94%, try using your index or middle finger and ensuring the sensor is clean. The project uses a stabilized ratio-of-ratios algorithm for calculation.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- [SparkFun](https://github.com/sparkfun/SparkFun_MAX3010x_Sensor_Library) for the excellent sensor library.
-- [Chart.js](https://www.chartjs.org/) for the beautiful real-time charts.
+## 📜 License
+MIT License - See [LICENSE](LICENSE) for details.
