@@ -49,7 +49,7 @@ void sendSerialPulse(long irValue) {
 
 // 2. Batched WebSocket (Network efficient)
 void sendPulse() {
-  if (ws.count() > 0) {
+  if (ws.count() > 0 && ws.getQueueLen() < WS_MAX_QUEUED_MESSAGES) {
     String json = "{\"ir\":[";
     for(int i=0; i<5; i++) {
       json += String(irBatch[i]);
@@ -67,7 +67,7 @@ void sendMetrics() {
            beatAvg, lastSpO2, lastPI, lastTemp, lastHRV, lastConfidence, currentStatus.c_str(), currentRSSI);
   
   // WebSocket
-  if (ws.count() > 0) {
+  if (ws.count() > 0 && ws.getQueueLen() < WS_MAX_QUEUED_MESSAGES) {
     ws.textAll(json);
     wsMsgCount++;
   }

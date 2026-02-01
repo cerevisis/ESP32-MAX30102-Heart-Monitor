@@ -1,6 +1,8 @@
-# Vital Sense: Advanced MAX30102 Heart Monitor
+# Vital Sense: Advanced MAX30102 Heart Monitor `v1.2.0`
 
 A high-performance Heart Rate and SpO2 monitoring system for the ESP32, featuring a real-time web dashboard with dual-transport telemetry (WebSocket + Web Serial).
+
+[View Changelog](file:///c:/Users/educk/Documents/Arduino/synced-projects/MAX30102HeartRate/Heart-Monitor/CHANGELOG.md)
 
 ![Dashboard Preview](https://via.placeholder.com/800x400?text=Vital+Sense+Dashboard+Preview)
 
