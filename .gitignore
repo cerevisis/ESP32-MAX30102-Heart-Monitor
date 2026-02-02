@@ -7,4 +7,3 @@ obj/
 *.bin
 *.elf
 *.hex
-secrets.h
